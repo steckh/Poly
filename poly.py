@@ -115,11 +115,20 @@ SETUP_SCRIPT = r"""#!/usr/bin/env bash
 # Usage:  bash setup.sh
 set -e
 if command -v apt >/dev/null 2>&1; then
-  PM="sudo apt install -y"; sudo apt update
+  PM="sudo apt install -y"
+  sudo apt-get -y upgrade 
+elif command -v dnf   >/dev/null 2>&1; then
+  PM="sudo dnf install -y"
+  sudo dnf -y upgrade --refresh  # sys update
 elif command -v pacman >/dev/null 2>&1; then
   PM="sudo pacman -S --needed --noconfirm"
+elif command -v emerge >/dev/null 2>&1; then
+  PM="sudo emerge --ask"
+  sudo emerge --sync # sys update 
 else
-  echo "No apt or pacman found. Install tools by hand."; exit 1
+  echo "No supported package manager found"
+  echo "Install the packages manually instead"
+  exit 1
 fi
 echo "[*] Core triage"
 $PM nmap curl wget git python3 python3-pip file binwalk exiftool steghide foremost gdb radare2 || true
