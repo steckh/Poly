@@ -9,7 +9,9 @@ hints, an arsenal that locates your wordlists and payload references, a results
 search, an offline cheat sheet, and a session report exporter. Standard library
 only.
 
-    python3 poly.py
+    python3 poly.py                    # the menu
+    python3 poly.py 10.10.10.5         # scan one target straight from the shell
+    python3 poly.py 10.10.10.5 --deep  # ... with the deep (UDP + vuln + web enum) pass
 
 Tooling knobs live in the CONFIG block at the top. MIT-licensed; see LICENSE.
 
@@ -26,6 +28,7 @@ import sys
 import json
 import shutil
 import socket
+import argparse
 import datetime
 import tempfile
 import ipaddress
@@ -48,14 +51,13 @@ CONFIG = {
     "udp_top_ports": "20",       # how many top UDP ports the deep scan sweeps
     "vhost_domain": "",          # e.g. "htb" or "example.com" -> deep scan fuzzes vhosts; "" disables it
     "keep_raw_files": False,     # False = one tidy scan folder (summary.md + nmap.xml + details.txt); True = keep every raw tool file
+    "scan_timeout": 1800,        # seconds before any single tool is cut off (its partial output is kept)
+    "max_web_ports": 4,          # deep scan web-enums at most this many discovered http(s) ports
 }
 
 # ======================================================================
 # content  -  generic CTF reference; edit freely
 # ======================================================================
-
-
-
 LINKS = [
     ("HackTricks (methodology)", "https://book.hacktricks.xyz/"),
     ("GTFOBins (privesc ref)", "https://gtfobins.github.io/"),
@@ -89,7 +91,7 @@ ADVISOR = [
 ]
 
 SETUP_SCRIPT = r"""#!/usr/bin/env bash
-# Tool setup for Poly. Detects apt, pacman or Homebrew.
+# Tool setup for Poly. Detects apt, pacman, dnf, emerge or Homebrew.
 # Each package is installed on its own, so one name your distro does not carry
 # cannot stop the rest from installing. Whatever failed is listed at the end.
 # Usage:  bash setup.sh
@@ -105,13 +107,24 @@ elif command -v pacman >/dev/null 2>&1; then
   CORE="nmap curl wget git python python-pip python-pipx file binwalk perl-image-exiftool gdb radare2"
   WEB="feroxbuster ffuf gobuster sqlmap nikto"
   NET="smbclient net-snmp hydra john xclip"
+elif command -v dnf >/dev/null 2>&1; then
+  inst() { sudo dnf install -y "$1" >/dev/null 2>&1; }
+  CORE="nmap curl wget git python3 python3-pip pipx file binwalk perl-Image-ExifTool gdb radare2"
+  WEB="ffuf gobuster sqlmap nikto"
+  NET="samba-client net-snmp-utils hydra john xclip"
+elif command -v emerge >/dev/null 2>&1; then
+  sudo emerge --sync
+  inst() { sudo emerge --noreplace --quiet "$1" >/dev/null 2>&1; }   # never --ask: output is hidden
+  CORE="nmap curl wget git pipx file exiftool gdb radare2"
+  WEB="sqlmap"
+  NET="samba net-snmp hydra john xclip"
 elif command -v brew >/dev/null 2>&1; then
   inst() { brew install "$1" >/dev/null 2>&1; }
   CORE="nmap curl wget git python pipx binwalk exiftool radare2"
   WEB="feroxbuster ffuf gobuster sqlmap nikto whatweb exploitdb"
   NET="net-snmp hydra john-jumbo"
 else
-  echo "No apt, pacman or brew found. Install tools by hand."; exit 1
+  echo "No apt, pacman, dnf, emerge or brew found. Install tools by hand."; exit 1
 fi
 
 try_all() {
@@ -179,6 +192,22 @@ class C:
     BOLD = "\033[1m"
     X = "\033[0m"
 
+# no colour when piped / redirected, or when NO_COLOR is set (no-color.org)
+_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+if not _COLOR:
+    for _k in [k for k in vars(C) if k.isupper()]:
+        setattr(C, _k, "")
+elif os.name == "nt":
+    os.system("")  # turns on ANSI escape handling in the Windows console
+
+# never crash on a glyph the output encoding can't show (box-drawing logo
+# piped through a cp1252 console, odd bytes in tool output, ...)
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 # ----------------------------------------------------------------------
 # state location (shared folder support)
 # ----------------------------------------------------------------------
@@ -198,7 +227,7 @@ WORDLIST = next((w for w in [
     "/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt",
 ] if w and os.path.exists(w)), None)
 
-SCAN_TIMEOUT = 1800  # seconds, per tool
+SCAN_TIMEOUT = int(CONFIG.get("scan_timeout") or 1800)  # seconds, per tool
 
 def _dir_cmd(url):
     """Build the directory-brute command from CONFIG['dir_tool'], falling back
@@ -307,10 +336,41 @@ def classify_target(raw):
     except ValueError:
         is_ip = False
     if path is not None:
+        if is_ip and tail.isdigit():               # 10.10.10.0/24 is a range, not a URL path
+            return None
         return {"kind": "web", "host": host_part, "port": port, "scheme": "http",
                 "path": path, "display": s}
     return {"kind": "host", "host": host_part, "port": port, "scheme": None,
             "path": None, "display": s, "is_ip": is_ip}
+
+def _is_cidr(raw):
+    """10.10.10.0/24 style range: refused as a target, but worth a pointer."""
+    s = raw.strip()
+    if "/" not in s or not s.rsplit("/", 1)[1].isdigit():
+        return False
+    try:
+        ipaddress.ip_network(s, strict=False)
+        return True
+    except ValueError:
+        return False
+
+def _range_hint(raw):
+    print(f"  {C.Y}'{raw}' is an address range.{C.X} {C.DIM}Poly scans single hosts. Find the live ones first:{C.X}")
+    print(f"    {C.W}nmap -sn {raw}{C.X}")
+    print(f"  {C.DIM}then paste each live IP here.{C.X}")
+
+def _looks_like_target(raw, parsed):
+    """Weed out typos / bare words (a valid hostname like 'foo') before anything
+    gets scanned from the paste-and-go prompt."""
+    if not parsed:
+        return False
+    if "://" in raw or "/" in raw or "." in parsed["host"]:
+        return True
+    try:
+        ipaddress.ip_address(parsed["host"]); return True
+    except ValueError:
+        pass
+    return bool(parsed.get("port"))
 
 WEB_METHOD = [
     "robots.txt, sitemap.xml, /.git/, view-source + HTML comments.",
@@ -341,7 +401,8 @@ def header():
     rows = LOGO.strip("\n").split("\n")
     print()
     for i, row in enumerate(rows):
-        print(f"\033[1;38;5;{shades[min(i, len(shades)-1)]}m{row}{C.X}")
+        shade = f"\033[1;38;5;{shades[min(i, len(shades)-1)]}m" if _COLOR else ""
+        print(f"{shade}{row}{C.X}")
     print(f"    {C.Y}{TAGLINE}{C.X}\n")
     print(f"  {C.BOLD}{C.W}{CONFIG['name']}{C.X}  {C.DIM}{CONFIG['subtitle']}{C.X}")
     if _STATE != _HERE:
@@ -505,8 +566,30 @@ def _hostnames_from_scripts(scripts, host):
             good.append(n)
     return sorted(good)
 
+# nmap service names that contain "http" but are MSRPC transports, not websites
+_NOT_WEB = {"ncacn_http", "http-rpc-epmap"}
+
+def _is_winrm(service, port):
+    """WinRM answers HTTP on 5985/5986 (nmap: http, Microsoft HTTPAPI), but
+    directory-bruting it is noise; it is a remote-shell port."""
+    s = (service or "").lower().split("/")[-1]
+    return s in ("wsman", "wsmans", "winrm") or (str(port) in ("5985", "5986") and "http" in s)
+
+def _is_web(service, port):
+    s = (service or "").lower()
+    return "http" in s and s.split("/")[-1] not in _NOT_WEB and not _is_winrm(service, port)
+
 def _service_hint(service, port, host):
     s = (service or "").lower()
+    base = s.split("/")[-1]                        # "ssl/ldap" -> "ldap"
+    tls = s.startswith("ssl/")
+    if _is_winrm(s, port):
+        return (f"netexec winrm {host}  (confirms WinRM) ; once you hold creds: "
+                f"evil-winrm -i {host} -u <user> -p <pass>")
+    if base in _NOT_WEB:
+        return f"MSRPC over HTTP, not a website: enumerate RPC instead (rpcclient -U '' -N {host})"
+    if tls and base in ("imap", "pop3", "smtp", "ftp"):
+        return f"openssl s_client -connect {host}:{port}  (then speak {base.upper()} by hand)"
     H = {
         "ftp": f"ftp {host}  (try anonymous) ; nmap --script ftp-anon -p{port} {host}",
         "ssh": f"ssh user@{host} -p {port}  (note the version)",
@@ -514,7 +597,9 @@ def _service_hint(service, port, host):
         "netbios-ssn": f"enum4linux-ng {host} ; smbclient -L //{host}/ -N",
         "snmp": f"snmpwalk -v2c -c public {host}",
         "tftp": f"tftp {host}  (get a known filename - no listing) ; nmap -sU --script tftp-enum -p{port} {host}",
-        "ldap": f"ldapsearch -x -H ldap://{host}:{port} -s base namingContexts",
+        "ldap": f"ldapsearch -x -H {'ldaps' if tls or str(port) in ('636', '3269') else 'ldap'}://{host}:{port} -s base namingContexts",
+        "kerberos-sec": f"domain controller - grab the domain from ldap/smb output, then kerbrute userenum --dc {host} -d <domain> users.txt",
+        "msrpc": f"rpcclient -U '' -N {host}  (enumdomusers ; querydispinfo)",
         "rpcbind": f"rpcinfo -p {host} ; showmount -e {host}",
         "nfs": f"showmount -e {host}",
         "mysql": f"mysql -h {host} -P {port} -u root -p",
@@ -527,10 +612,14 @@ def _service_hint(service, port, host):
         "imap": f"nc {host} {port}",
         "rdp": f"xfreerdp /u:user /v:{host}:{port}",
         "telnet": f"telnet {host} {port}",
+        "vnc": f"nmap --script vnc-info -p{port} {host}  (look for 'None' auth) ; vncviewer {host}::{port}",
+        "mongodb": f"mongosh --host {host} --port {port}  (try without auth: show dbs)",
+        "rsync": f"rsync --list-only rsync://{host}:{port}/  (list modules, then pull readable ones)",
+        "mountd": f"showmount -e {host}",
     }
-    if s in H:
-        return H[s]
-    if "http" in s:
+    if base in H:
+        return H[base]
+    if _is_web(s, port):
         url = _web_url(_http_scheme(s, port), host, port)
         wl = WORDLIST or "/usr/share/wordlists/dirb/common.txt"
         return (f"gobuster dir -u {url} -w {wl}"
@@ -624,7 +713,7 @@ def _scan_summary(t, rows, xmlp, scan_dir=None, udp_rows=None, problems=None):
     for r in rows + udp_rows:
         hint = _service_hint(r["service"], r["port"], host)
         if hint and hint not in seen:
-            seen.add(hint); steps.append((r["service"], hint))
+            seen.add(hint); steps.append((f"{r['port']}/{r['service']}", hint))
     t["next_steps"] = steps
 
     # --- important info, on the terminal ---
@@ -690,6 +779,14 @@ def _scan_summary(t, rows, xmlp, scan_dir=None, udp_rows=None, problems=None):
 # ----------------------------------------------------------------------
 # saved results
 # ----------------------------------------------------------------------
+def _rel(path):
+    """Path relative to the state dir for display (falls back to absolute,
+    e.g. across Windows drives)."""
+    try:
+        return os.path.relpath(path, _STATE)
+    except ValueError:
+        return path
+
 def _iter_result_files():
     """Every file under results/, recursing into the per-scan subfolders."""
     if not os.path.isdir(RESULTS_DIR):
@@ -717,8 +814,9 @@ _OK_RC = {"nikto": (0, 1)}   # nikto exits 1 whenever it reports findings
 
 def _run_tool(cmd, outpath):
     """Run one tool, output captured to outpath. Returns (state, message) where
-    state is ok | failed | timeout | skipped | error, so callers can tell a
-    clean run from one that died part way."""
+    state is ok | failed | timeout | interrupted | skipped | error, so callers
+    can tell a clean run from one that died part way. Ctrl+C skips just this
+    tool (its partial output is kept) instead of killing Poly."""
     exe = cmd[0]
     if exe == "sudo":                      # the real tool is the first non-flag arg
         exe = next((a for a in cmd[1:] if not a.startswith("-")), "sudo")
@@ -737,6 +835,8 @@ def _run_tool(cmd, outpath):
     except subprocess.TimeoutExpired:
         lim = f"{SCAN_TIMEOUT // 60}m" if SCAN_TIMEOUT >= 60 else f"{SCAN_TIMEOUT}s"
         return "timeout", f"{C.Y}timed out{C.X} after {lim} (partial)  ->  {C.CY}{outpath}{C.X}"
+    except KeyboardInterrupt:
+        return "interrupted", f"{C.Y}skipped (ctrl+c){C.X} (partial)  ->  {C.CY}{outpath}{C.X}"
     except Exception as e:
         return "error", f"{C.R}error: {e}{C.X}"
     if proc.returncode not in _OK_RC.get(os.path.basename(exe), (0,)):
@@ -762,7 +862,8 @@ def _run_nmap(t, scan_dir):
         print(f"  {C.R}nmap is not installed.{C.X}")
         problems.append("nmap is not installed, so nothing was scanned (menu [m] -> Install / check tools).")
         return nmap_xml, [], [], problems
-    print(f"  {C.B}nmap 1/2{C.X}  {C.DIM}full-range sweep, all 65535 ports (-Pn -p- {timing}){C.X}")
+    print(f"  {C.B}nmap 1/2{C.X}  {C.DIM}full-range sweep, all 65535 ports (-Pn -p- {timing})  "
+          f"ctrl+c = stop early, keep what it found{C.X}")
     # -v makes nmap print each open port as soon as it finds it, so a sweep
     # that gets cut off can still report what it reached
     st, msg = _run_tool(["nmap", *fam, "-v", "-Pn", "-p-", timing, "-oX", stage1_xml, host], stage1_txt)
@@ -802,9 +903,9 @@ def _web_urls(t, rows):
     out = []
     for r in rows:
         svc = (r.get("service") or "").lower()
-        if r.get("proto", "tcp") == "tcp" and "http" in svc:
+        if r.get("proto", "tcp") == "tcp" and _is_web(svc, r["port"]):
             out.append((r["port"], _web_url(_http_scheme(svc, r["port"]), t["host"], r["port"])))
-    return out
+    return out[:int(CONFIG.get("max_web_ports") or 4)]
 
 def _smb_present(rows):
     return any((r.get("service") or "").lower() in ("microsoft-ds", "netbios-ssn")
@@ -942,38 +1043,40 @@ def _recon_core(t, deep=False, udp=False):
         t["status"] = "scanned" if t.get("status", "todo") == "todo" else t.get("status")
     return scan_dir
 
-def run_recon(t):
-    clear(); header()
-    print(f"\n  {C.BOLD}{C.W}RUN RECON{C.X}  ->  {C.W}{t['display']}{C.X}  {C.DIM}({t['kind']}){C.X}\n")
+def _scan_flow(t, deep=False, title=None, interactive=True):
+    """Auth gate -> scan -> save -> post-scan prompt. Shared by the target
+    board ([r] / [e]), paste-and-go, and the command line. Returns the scan
+    folder, or None if cancelled / refused."""
+    if interactive:
+        clear(); header()
+    title = title or ("DEEP SCAN" if deep else "RECON")
+    kind = "UDP + vuln + SMB/web enum" if deep else t["kind"]
+    print(f"\n  {C.BOLD}{C.W}{title}{C.X}  ->  {C.W}{t['display']}{C.X}  {C.DIM}({kind}){C.X}\n")
     if not _auth_gate(t["host"]):
-        print(f"  {C.DIM}cancelled.{C.X}"); pause(); return
-    print()
-    scan_dir = _recon_core(t)
-    if not scan_dir:
-        pause(); return
-    _save(TARGETS_FILE, _targets_with(t))
-    print(f"\n  {C.G}Results saved under:{C.X} {C.CY}{scan_dir}{C.X}")
-    _post_scan_actions(t)
-    _save(TARGETS_FILE, _targets_with(t))
-    pause()
-
-def full_scan_target(t, deep=False):
-    """One keypress deep scan: recon plus the top UDP ports and, on a web target,
-    the heavier web enum tools."""
-    clear(); header()
-    kind = "UDP + web enum" if deep else "recon"
-    print(f"\n  {C.BOLD}{C.W}{'DEEP SCAN' if deep else 'FULL SCAN'}{C.X}  ->  {C.W}{t['display']}{C.X}  {C.DIM}({kind}){C.X}\n")
-    if not _auth_gate(t["host"]):
-        print(f"  {C.DIM}cancelled.{C.X}"); pause(); return
+        print(f"  {C.DIM}cancelled.{C.X}")
+        if interactive:
+            pause()
+        return None
     print()
     scan_dir = _recon_core(t, deep=deep, udp=deep)
-    if not scan_dir:
-        pause(); return
-    _save(TARGETS_FILE, _targets_with(t))
-    print(f"\n  {C.G}Done. Results under:{C.X} {C.CY}{scan_dir}{C.X}")
-    _post_scan_actions(t)
-    _save(TARGETS_FILE, _targets_with(t))
-    pause()
+    if scan_dir:
+        _save(TARGETS_FILE, _targets_with(t))
+        print(f"\n  {C.G}Done. Results under:{C.X} {C.CY}{scan_dir}{C.X}")
+        if title == "QUICK SCAN":
+            print(f"  {C.DIM}Saved to the board - open [1] for a deep scan ([e]), loot, or status.{C.X}")
+        _post_scan_actions(t)
+        _save(TARGETS_FILE, _targets_with(t))
+    if interactive:
+        pause()
+    return scan_dir
+
+def run_recon(t):
+    _scan_flow(t)
+
+def full_scan_target(t, deep=False):
+    """One keypress deep scan: recon plus the top UDP ports, nmap vuln scripts,
+    SMB enum and, on every web port, the heavier web enum tools."""
+    _scan_flow(t, deep=deep)
 
 def scan_all():
     """One keypress from the menu: full scan every target, then report + flag hunt."""
@@ -991,8 +1094,8 @@ def scan_all():
         print(f"  {C.DIM}cancelled.{C.X}"); pause(); return
     for t in targets:
         print(f"\n  {C.BOLD}{C.CY}== {t['display']} =={C.X}")
-        _recon_core(t)
-    _save(TARGETS_FILE, targets)
+        if _recon_core(t):
+            _save(TARGETS_FILE, targets)      # after each box, so a crash loses at most one
     path = _write_report()
     print(f"\n  {C.G}All done. Combined report:{C.X} {C.CY}{path}{C.X}")
     pause()
@@ -1077,7 +1180,7 @@ def _write_box_report(t):
             if t.get("results"):
                 f.write("## Result files\n\n")
                 for r in t["results"]:
-                    f.write(f"- `{os.path.relpath(r, _STATE)}`\n")
+                    f.write(f"- `{_rel(r)}`\n")
         return path
     except Exception as e:
         return f"(error: {e})"
@@ -1114,6 +1217,12 @@ def _write_report():
                         f.write("- open services:\n")
                         for s in t["services"]:
                             f.write(f"  - {s}\n")
+                    if t.get("script_findings"):
+                        f.write("- nmap script findings:\n")
+                        for ln in t["script_findings"]:
+                            f.write(f"  - {ln}\n")
+                    if t.get("hostnames"):
+                        f.write(f"- hostnames: `{t['host']} {' '.join(t['hostnames'])}`\n")
                     if t.get("loot"):
                         f.write("- loot / notes:\n")
                         for note in t["loot"]:
@@ -1121,7 +1230,7 @@ def _write_report():
                     if t.get("results"):
                         f.write("- result files:\n")
                         for r in t["results"]:
-                            f.write(f"  - `{r}`\n")
+                            f.write(f"  - `{_rel(r)}`\n")
                     f.write("\n")
     except Exception as e:
         return f"(could not write report: {e})"
@@ -1190,12 +1299,16 @@ def screen_targets():
             return
         elif ch == "a":
             raw = input("  target (IP, host:port, or https://... link): ").strip()
+            if _is_cidr(raw):
+                _range_hint(raw); pause(); continue
             parsed = classify_target(raw)
             if not parsed:
                 if raw:
                     print(f"  {C.R}not a valid IP, host:port, or http(s):// URL.{C.X}")
                     pause()
                 continue
+            if any(t.get("display") == parsed["display"] for t in targets):
+                print(f"  {C.DIM}already on the board.{C.X}"); pause(); continue
             owner = input("  owner (optional): ").strip()
             parsed["owner"] = owner or "-"
             parsed["status"] = "todo"
@@ -1243,6 +1356,17 @@ def _view_target(t):
             print(f"\n  {C.Y}Open services (last scan){C.X}")
             for s in t["services"]:
                 print(f"    {C.DIM}-{C.X} {s}")
+        if t.get("script_findings"):
+            print(f"\n  {C.Y}Script findings{C.X}")
+            for ln in t["script_findings"]:
+                print(f"    {C.DIM}-{C.X} {ln}")
+        if t.get("hostnames"):
+            print(f"\n  {C.Y}Hostnames{C.X}  {C.W}{t['host']} {' '.join(t['hostnames'])}{C.X}")
+        steps = t.get("next_steps") or []
+        if steps:
+            print(f"\n  {C.Y}Next steps{C.X}  {C.DIM}(c# copies one, e.g. c0){C.X}")
+            for i, (svc, hint) in enumerate(steps):
+                print(f"    {C.G}[{i}]{C.X} {C.CY}{svc}{C.X}: {hint}")
         loot = t.get("loot", [])
         print(f"\n  {C.Y}Loot / notes{C.X}  {C.DIM}(creds, hashes, paths, anything you find){C.X}")
         if not loot:
@@ -1258,15 +1382,21 @@ def _view_target(t):
         res = t.get("results", [])
         print(f"\n  {C.Y}Saved result files{C.X}")
         if not res:
-            print(f"    {C.DIM}none yet. [f] or [r] on the list runs scans.{C.X}")
+            print(f"    {C.DIM}none yet. [r] or [e] on the board runs scans.{C.X}")
         else:
             for r in res:
                 flag = "" if os.path.exists(r) else f"  {C.R}(missing){C.X}"
-                print(f"    {C.DIM}-{C.X} {C.CY}{os.path.relpath(r, _STATE)}{C.X}{flag}")
+                print(f"    {C.DIM}-{C.X} {C.CY}{_rel(r)}{C.X}{flag}")
         print(f"\n  {C.DIM}[l] add loot   [x] delete loot   [w] write box report   [b] back{C.X}")
         ch = input("  > ").strip().lower()
         if ch == "b":
             return
+        elif ch.startswith("c") and ch[1:].isdigit() and int(ch[1:]) < len(steps):
+            cmd = steps[int(ch[1:])][1]
+            tool = _clip(cmd)
+            print(f"  {C.G}copied ({tool}):{C.X} {cmd}" if tool
+                  else f"  {C.DIM}no clipboard tool. cmd:{C.X} {cmd}")
+            pause()
         elif ch == "l":
             note = input("  loot (cred / hash / path / finding): ").strip()
             if note:
@@ -1291,13 +1421,13 @@ def write_setup():
         os.chmod(path, 0o755)
         print(f"\n  {C.G}Wrote setup script to:{C.X} {path}")
         print(f"  Run it on any machine:  {C.CY}bash setup.sh{C.X}")
-        print(f"  {C.DIM}Installs standard free tooling via apt, pacman or brew. Review it before running.{C.X}")
+        print(f"  {C.DIM}Installs standard free tooling via apt, pacman, dnf, emerge or brew. Review it before running.{C.X}")
     except Exception as e:
         print(f"\n  {C.R}could not write setup.sh: {e}{C.X}")
     pause()
 
 # whichever clipboard tool this box has (pbcopy on macOS, wl-copy on Wayland, X11 tools)
-_CLIP_BIN = next((b for b in ("pbcopy", "wl-copy", "xclip", "xsel") if shutil.which(b)), "xclip")
+_CLIP_BIN = next((b for b in ("pbcopy", "wl-copy", "xclip", "xsel", "clip.exe") if shutil.which(b)), "xclip")
 
 # the binaries Poly actually invokes, in the order they matter
 TOOL_AUDIT = [
@@ -1499,7 +1629,9 @@ def _find_repo(names):
     return _first_existing(cands, want_dir=True)
 
 def _clip(text):
-    for tool in (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "-ib"]):
+    """Copy to the clipboard: macOS, Wayland, X11, then WSL / Windows."""
+    for tool in (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "-ib"],
+                 ["clip.exe"], ["clip"]):
         if shutil.which(tool[0]):
             try:
                 if subprocess.run(tool, input=text.encode(), timeout=5).returncode == 0:
@@ -1620,46 +1752,29 @@ MENU = [
     ("m", "More (setup + reference)", screen_more),
 ]
 
-def _quick_target(raw):
+def _quick_target(raw, deep=False, interactive=True):
     """Paste-and-go: classify a pasted IP / host:port / URL, add it to the board,
-    and run the default scan straight away (recon)."""
+    and run the default scan straight away (recon, or deep from the CLI)."""
     parsed = classify_target(raw)
-
-    def _looks_like_target(p):
-        if not p or not p.get("host"):
-            return False
-        if "://" in raw or "/" in raw or "." in p["host"]:
-            return True
-        try:
-            ipaddress.ip_address(p["host"]); return True
-        except ValueError:
-            pass
-        return bool(p.get("port"))
-
-    if not _looks_like_target(parsed):
+    if _is_cidr(raw):
+        _range_hint(raw.strip())
+        if interactive:
+            pause()
+        return None
+    if not _looks_like_target(raw, parsed):
         print(f"  {C.DIM}'{raw}' isn't a menu option or a target.")
         print(f"  Paste an IP, host:port, or http(s):// URL to scan it now.{C.X}")
-        pause(); return
+        if interactive:
+            pause()
+        return None
     targets = _load(TARGETS_FILE)
     existing = next((t for t in targets
                      if t.get("display") == parsed["display"] and t.get("host") == parsed["host"]), None)
     t = existing or parsed
     if not existing:
         t.setdefault("owner", "-"); t.setdefault("status", "todo")
-    clear(); header()
-    print(f"\n  {C.BOLD}{C.W}QUICK SCAN{C.X}  ->  {C.W}{t['display']}{C.X}  {C.DIM}({t['kind']}){C.X}\n")
-    if not _auth_gate(t["host"]):
-        print(f"  {C.DIM}cancelled.{C.X}"); pause(); return
-    print()
-    scan_dir = _recon_core(t)
-    if not scan_dir:
-        pause(); return
-    _save(TARGETS_FILE, _targets_with(t))
-    print(f"\n  {C.G}Done. Results under:{C.X} {C.CY}{scan_dir}{C.X}")
-    print(f"  {C.DIM}Saved to the board - open [1] for a deep scan ([e]), loot, or status.{C.X}")
-    _post_scan_actions(t)
-    _save(TARGETS_FILE, _targets_with(t))
-    pause()
+    return _scan_flow(t, deep=deep, title="DEEP SCAN" if deep else "QUICK SCAN",
+                      interactive=interactive)
 
 _SAMPLE_XML = """<?xml version="1.0"?>
 <nmaprun><host><ports>
@@ -1690,6 +1805,9 @@ def _selftest():
     t = ct("[dead:beef::1]:80")
     assert (t["host"], t["port"]) == ("dead:beef::1", 80), t
     assert ct("::1")["host"] == "::1"
+    # a CIDR is a range to sweep with nmap -sn, not a web target with path /24
+    assert ct("10.10.10.0/24") is None and _is_cidr("10.10.10.0/24") and not _is_cidr("box.htb/24")
+    assert not _looks_like_target("foo", ct("foo")) and _looks_like_target("box.htb", ct("box.htb"))
     assert _nmap_family("dead:beef::1") == ["-6"] and _nmap_family("10.10.10.5") == []
 
     with tempfile.TemporaryDirectory() as d:
@@ -1713,6 +1831,13 @@ def _selftest():
         assert _web_urls(ct("http://box.htb:81/x"), rows) == [("", "http://box.htb:81/x")]
         assert "https://10.10.10.5/" in _service_hint("ssl/http", "443", "10.10.10.5")
 
+        # RPC-over-HTTP and WinRM say "http" but are not websites
+        rpc = [{"port": "593", "proto": "tcp", "service": "ncacn_http"},
+               {"port": "5985", "proto": "tcp", "service": "http"}]
+        assert _web_urls(host_t, rpc) == [], _web_urls(host_t, rpc)
+        assert "evil-winrm" in _service_hint("http", "5985", "10.10.10.5")
+        assert "ldaps://" in _service_hint("ssl/ldap", "636", "10.10.10.5")
+
         # a sweep killed part way: XML has no ports, the -v log still does
         trunc = os.path.join(d, "trunc.xml")
         with open(trunc, "w", encoding="utf-8") as f:
@@ -1733,11 +1858,21 @@ def _selftest():
         st, _ = _run_tool(["poly-no-such-tool"], os.path.join(d, "n.txt"))
         assert st == "skipped", st
 
-def main():
-    if "--check" in sys.argv:
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="poly.py", description="Recon + enumeration console. Run with no arguments for the menu.",
+        epilog="Only scan systems you are explicitly authorized to test.")
+    ap.add_argument("target", nargs="?", help="IP, host:port or URL to scan straight away (asks for authorization first)")
+    ap.add_argument("--deep", action="store_true", help="with a target: add UDP, nmap vuln scripts, SMB and web enum")
+    ap.add_argument("--check", action="store_true", help="run the offline self-test and exit")
+    args = ap.parse_args(argv)
+    if args.check:
         _selftest()
         print("selftest ok")
         return
+    if args.target:
+        header()
+        sys.exit(0 if _quick_target(args.target, deep=args.deep, interactive=False) else 1)
     keys = {key for key, _, _ in MENU}
     while True:
         clear(); header()
@@ -1751,13 +1886,16 @@ def main():
             clear()
             print(f"{C.BR}stay sharp.{C.X}\n")
             return
-        if choice in keys:
-            for key, _, fn in MENU:
-                if choice == key:
-                    fn()
-                    break
-        elif raw:
-            _quick_target(raw)
+        try:                          # ctrl+c inside a screen backs out to this menu
+            if choice in keys:
+                for key, _, fn in MENU:
+                    if choice == key:
+                        fn()
+                        break
+            elif raw:
+                _quick_target(raw)
+        except KeyboardInterrupt:
+            pass
 
 if __name__ == "__main__":
     try:
